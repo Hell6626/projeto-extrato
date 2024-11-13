@@ -1,9 +1,9 @@
-#importações
 import re
 import pytesseract
 import pdfplumber
 import sys
 import os
+import io
 import fitz  # Importa PyMuPDF
 import unicodedata
 import cv2
@@ -13,6 +13,173 @@ from pdf2image import convert_from_path
 from PyPDF2 import PdfReader
 from PyQt5 import QtWidgets
 
+
+'''------------------------------------------------------------------------------------------------------------'''
+
+'''BANCO DO BRASIL'''
+
+def extract_banco_do_brasil(pdf_path, output_txt_path, cabecalho):
+    print("Processando extrato do Banco do Brasil")
+    
+    try:
+        # Leitura do PDF
+        with open(pdf_path, 'rb') as pdf_file:
+            pdf_reader = PdfReader(pdf_file)
+            all_text = "".join(page.extract_text() or '' for page in pdf_reader.pages)
+
+        lines = all_text.split('\n')
+        
+        # Padrões de regex para tentar
+        padrao1 = re.compile(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(\(-\)|\(\+\))\s*(\d{2}/\d{2}/\d{4})\s*(\d+)\s*(\d+)\s*(.*)")
+        padrao2 = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*(\(-\)|\(\+\))\s*(\d{2}/\d{2}/\d{4})\s*(.*)")
+
+        linhas_processadas = []
+
+        for linha in lines:
+            if "Saldo Anterior" in linha or "S A L D O" in linha:
+                continue
+            # Teste para o primeiro padrão
+            correspondencia1 = padrao1.match(linha)
+            if correspondencia1:
+                valor, sinal, data, lote, documento, historico = correspondencia1.groups()
+                if sinal == "(-)":
+                    linha_formatada = f"{data}; {historico}; {lote} {documento}; {valor};\n"
+                else:
+                    linha_formatada = f"{data}; {historico}; {lote} {documento}; ; {valor};\n"
+                linhas_processadas.append(linha_formatada)
+                continue  # Pular para a próxima linha se o primeiro padrão corresponder
+
+            # Teste para o segundo padrão
+            correspondencia2 = padrao2.match(linha)
+            if correspondencia2:
+                valor, sinal, data, historico = correspondencia2.groups()
+                if sinal == "(-)":
+                    linha_formatada = f"{data}; {historico};;{valor};\n"
+                else:
+                    linha_formatada = f"{data}; {historico};;;{valor}\n"
+                linhas_processadas.append(linha_formatada)
+
+        # Escrevendo no arquivo de saída
+        with open(output_txt_path, 'w', encoding='utf-8') as arquivo_saida:
+            arquivo_saida.write(cabecalho + "\n")  # Cabeçalho
+            for linha in linhas_processadas:
+                arquivo_saida.write(linha)
+
+        print(f"Arquivo TXT criado com sucesso: {output_txt_path}")
+        print(f"Número de linhas escritas: {len(linhas_processadas)}")
+
+    except FileNotFoundError:
+        print(f"Erro: O arquivo PDF não foi encontrado: {pdf_path}")
+    except PermissionError:
+        print(f"Erro: Sem permissão para acessar o arquivo: {pdf_path}")
+    except Exception as e:
+        print(f"Ocorreu um erro: {str(e)}")
+
+
+'''------------------------------------------------------------------------------------------------------------'''
+
+'''BRADESCO PDF'''
+
+def extract_bradesco_PDF(pdf_path, output_txt_path, cabecalho, mes, ano):
+    print("Processando extrato do Bradesco (PDF)")
+    
+    try:
+        # Criando um objeto PdfReader
+        pdf_reader = PdfReader(pdf_path)
+        
+        # Abrindo o arquivo txt para escrita
+        with open(output_txt_path, 'w', encoding='utf-8') as txt_file:
+            txt_file.write(cabecalho + "\n")  # Escreve o cabeçalho primeiro
+            last_date = ""  # Variável para armazenar a última data encontrada
+            line_group = ""  # Armazena o grupo de linhas a ser concatenado
+            
+            # Iterando sobre todas as páginas do PDF
+            for page_num in range(len(pdf_reader.pages)):
+                page = pdf_reader.pages[page_num]
+                text = page.extract_text()
+                
+                # Removendo informações desnecessárias logo após a extração do texto
+                text = re.sub(r'(Folha .*|CNPJ: .*|Nome do usuário: .*|Data da operação: .*|(?<! )Folha .*|(?<! )CNPJ: .*|(?<! )Nome do usuário: .*|(?<! )Data da operação: .*)', '', text)
+                
+                lines = text.splitlines()
+                
+                for line in lines:
+                    date_match = re.match(r'(\d{2}/\d{2}/\d{4})', line)
+                    ends_with_value = re.search(r'-?\d{1,3}(?:\.\d{3})*(?:,\d{2})$', line)
+                    
+                    if date_match:
+                        if line_group and re.search(r'-?\d{1,3}(?:\.\d{3})*(?:,\d{2})$', line_group.strip()):
+                            line_group = line_group.strip()
+                            txt_file.write(f"{last_date}; {line_group.strip()}\n")
+                        
+                        last_date = date_match.group(1)
+                        line_group = line[len(date_match.group(0)):].strip()
+                        
+                    elif ends_with_value:
+                        line_group += f"; {line}"
+                        if re.search(r'-?\d{1,3}(?:\.\d{3})*(?:,\d{2})$', line_group.strip()):
+                            line_group = line_group.strip()
+                            if line_group.startswith('; '):
+                                line_group = line_group[2:]
+                            txt_file.write(f"{last_date}; {line_group.strip()}\n")
+                        line_group = ""
+                    else:
+                        line_group += f" {line}"
+
+                if line_group and re.search(r'-?\d{1,3}(?:\.\d{3})*(?:,\d{2})$', line_group.strip()):
+                    line_group = line_group.strip()
+                    if line_group.startswith('; '):
+                        line_group = line_group[2:]
+                    txt_file.write(f"{last_date}; {line_group.strip()}\n")
+                    line_group = ""
+
+        # Remover o último valor das linhas e filtrar por mês/ano
+        with open(output_txt_path, 'r', encoding='utf-8') as file:
+            lines = file.readlines()
+        
+        with open(output_txt_path, 'w', encoding='utf-8') as file:
+            file.write(cabecalho + "\n")  # Reescreve o cabeçalho
+            for line in lines:
+                if re.match(r'^\d{2}/\d{2}/\d{4}', line):
+                    # Verificar mês e ano
+                    data_match = re.match(r'(\d{2})/(\d{2})/(\d{4})', line)
+                    if data_match:
+                        mes_linha = data_match.group(2)
+                        ano_linha = data_match.group(3)
+                        
+                        if mes_linha != mes or ano_linha != ano:
+                            continue  # Pula para próxima linha se não for do mês/ano desejado
+                    
+                    modified_line = re.sub(r'(-?\d{1,3}(?:\.\d{3})*(?:,\d{2}))\s*$', '', line.strip())
+                    remaining_values = re.search(r'(-?\d{1,3}(?:\.\d{3})*(?:,\d{2}))\s*$', modified_line)
+                    
+                    if remaining_values:
+                        valor = remaining_values.group(0).strip()
+                        modified_line = modified_line[:modified_line.rfind(valor)].strip()
+                    else:
+                        valor = ""
+                    
+                    parts = modified_line.split(';')
+                    if len(parts) >= 2:
+                        data = parts[0].strip()
+                        historico = ' '.join(parts[1:]).strip()
+                        historico = re.sub(r'Extrato Mensal / Por Período AMARAL, MOREIRA & AMARAL OTICA LTDA \|    ', '', historico)
+
+                        if "Total" not in historico and historico:
+                            if valor:
+                                valor = valor.replace('.', '')  # Remove os pontos do valor
+                                if '-' in valor:  # Verifica se é um valor negativo
+                                    valor = valor.replace('-', '')  # Remove o sinal negativo
+                                    file.write(f"{data};{historico};;;{valor};\n")  # Valor negativo vai para a coluna de débito
+                                else:
+                                    file.write(f"{data};{historico};;{valor};;\n")  # Valor positivo vai para a coluna de crédito
+
+        print(f"Arquivo TXT criado com sucesso: {output_txt_path}")
+        return True
+
+    except Exception as e:
+        print(f"Ocorreu um erro: {str(e)}")
+        return False
 
 '''------------------------------------------------------------------------------------------------------------'''
 
@@ -32,7 +199,7 @@ def preprocess_image(image):
     return final_image
 
 
-def extract_bradesco(pdf_path, output_txt_path, cabecalho, mes, ano):
+def extract_bradesco_OCR(pdf_path, output_txt_path, cabecalho, mes, ano):
     print("Processando extrato do Bradesco")
     
     images = convert_from_path(pdf_path)
@@ -197,8 +364,8 @@ def remover_acentos(texto):
 def is_debit(value_indicator):
     return value_indicator == 'D'
 
-def extract_sicoob(pdf_path, output_txt_path, cabecalho):
-    print("sicoob")
+def sicoob_banco(pdf_path, output_txt_path, cabecalho):
+    print("extrato enviado pelo banco?")
     reader = PdfReader(pdf_path)
     extracted_text = [page.extract_text() for page in reader.pages]
 
@@ -210,7 +377,12 @@ def extract_sicoob(pdf_path, output_txt_path, cabecalho):
         matches = re.findall(pattern, page_text, re.DOTALL)
         entries.extend(matches)
 
-    formatted_txt_lines = ['Data;Historico;Documento;Valor Credito (Subtrai);Valor Debito (Soma);\n']
+    formatted_txt_lines = [
+        'Cabeçalho;;;;;\n',
+        'Competencia;01/10/2024;Conta Banco;1;Saldo Inicial;1\n',
+        'Lançamentos;;;;;\n',
+        'Data;Historico;Documento;Valor Credito (Subtrai);Valor Debito (Soma);\n'
+    ]
 
     for entry in entries:
         date, code, description, value = entry[:4]
@@ -227,58 +399,125 @@ def extract_sicoob(pdf_path, output_txt_path, cabecalho):
         formatted_txt_lines.append(line)
 
     with open(output_txt_path, 'w', encoding='utf-8') as text_file:
-        text_file.write(cabecalho)
         text_file.writelines(formatted_txt_lines)
+
+    return len(formatted_txt_lines)
+
+def sicoob_cliente(pdf_path, output_txt_path, cabecalho,ano):
+    print("extrato enviado pelo cliente")
+    # Abre o arquivo PDF
+    with open(pdf_path, 'rb') as arquivo_pdf:
+        # Cria um leitor de PDF
+        leitor_pdf = PdfReader(arquivo_pdf)
+        
+        # Abre o arquivo TXT para escrita
+        with open(output_txt_path, 'w', encoding='utf-8') as arquivo_txt:
+            # Escreve o cabeçalho
+            arquivo_txt.write('Cabeçalho;;;;;\n')
+            arquivo_txt.write('Competencia;01/10/2024;Conta Banco;1;Saldo Inicial;1\n')
+            arquivo_txt.write('Lançamentos;;;;;\n')
+            arquivo_txt.write('Data;Historico;Documento;Valor Credito (Subtrai);Valor Debito (Soma);\n')
+            
+            # Itera sobre cada página do PDF
+            for pagina in range(len(leitor_pdf.pages)):
+                # Extrai o texto da página
+                texto = leitor_pdf.pages[pagina].extract_text()
+                
+                # Usa expressão regular para separar linhas com datas
+                linhas = re.split(r'(?=\d{2}/\d{2})', texto)
+                
+                # Processa cada linha
+                for linha in linhas:
+                    linha = linha.strip()  # Remove espaços em branco no início e fim
+                    # Verifica se a linha começa com uma data
+                    if linha and re.match(r'\d{2}/\d{2}', linha):
+                        # Separa os componentes da linha
+                        componentes = re.match(r'(\d{2}/\d{2})(.+?)(\d{1,3}(?:\.\d{3})*,\d{2}[CD])(.+)', linha)
+                        if componentes:
+                            data = componentes.group(1)
+                            historico = componentes.group(2)
+                            valor = componentes.group(3)
+                            documento = componentes.group(4)
+                            
+                            # Ajusta o histórico e o valor se necessário
+                            match_valor = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2}[CD])$', historico + valor)
+                            if match_valor:
+                                valor_completo = match_valor.group(1)
+                                historico = (historico + valor)[:-(len(valor_completo))]
+                                valor = valor_completo.replace(".", "")
+                            
+                            # Verifica se o histórico contém "SALDO DO DIA"
+                            if "SALDO DO DIA" not in historico.upper():
+                                # Verifica se o valor é crédito (C) ou débito (D)
+                                if valor.endswith('C'):
+                                    linha_formatada = f"{data.strip()}/{ano};{historico.strip()};{documento.strip()};{valor.strip()[:-1]};;\n"
+                                elif valor.endswith('D'):
+                                    linha_formatada = f"{data.strip()}/{ano};{historico.strip()};{documento.strip()};;{valor.strip()[:-1]};\n"
+                                else:
+                                    # Caso não seja identificado C ou D, mantém o formato original
+                                    linha_formatada = f"linha não sem valor:\n{data.strip()}/{ano};{historico.strip()};{documento.strip()};{valor.strip()}\n"
+                                
+                                arquivo_txt.write(linha_formatada)
+
+def extract_sicoob(caminho_pdf, caminho_txt, cabecalho, ano):
+    # Tenta primeiro com extract_sicoob
+    linhas_sicoob = sicoob_banco(caminho_pdf, caminho_txt, cabecalho)
+    
+    # Se extract_sicoob produziu 4 ou menos linhas, usa pdf_para_txt
+    if linhas_sicoob <= 4:
+        sicoob_cliente(caminho_pdf, caminho_txt, cabecalho,ano)
+    else:
+        print(f"Extraído com sucesso usando extract_sicoob. Linhas processadas: {linhas_sicoob}")
 
 
 '''------------------------------------------------------------------------------------------------------------'''
 
 '''SICREDI PDF'''
 
-
-def debito(description):
-    debit_keywords = ["PAGAMENTO PIX", "PAG DEB", "SAQUE", "TARIFA", "COMPRA", "IOF ADICIONAL", "IOF BASICO"," LIQUIDACAO DE PARCELA","CHEQUE COMPE","CESTA DE RELACIONAMENTO", "CH.PAGO", "TARIFA SERV","DEB.CTA.FATURA", "DEBITO CONVENIOS","IOF S/ OPER","JUROS UTILIZ.CH.ESPECIAL","APLIC.FINANC.AVISO PREVIO", "INTEGR.CAPITAL",
-                      "CH.PAGO", "IOF","LIQUIDACAO", "DEB.","CHEQUE A PARTIR", "SEGURO","DEBITO ARRECADACAO", "DEBITO CHEQUE", 'TRANSF ENTRE CONTAS','APLICACAO FINANCEIRA','FOLHA CHEQUE ','MANUTENCAO DE TITULOS','AMORTIZACAO CONTRATO','JUROS ADTO. CREDITO ','ADIANT. DEPOSITANTE','DEPOSITANTE','JUROS CHEQUE INADIMPLENTE',
-                      'DEV. CHEQUE DEPOSITADO','CUSTAS DE PROTESTO','CHQ.APRESENTADO CX.','SUSTACAO/REVOGACAO','CHEQUE DEVOLVIDO','APLICACAO','PAGTO JUROS CONTR ROTATIV']
-    if "estorno" in description.lower():
-        for keyword in debit_keywords:
-            if "estorno " + keyword.lower() in description.lower():
-                return False
-    return any(keyword in description for keyword in debit_keywords)
-
-def credito(description):
-    credit_keywords = ["TED ",#"DEP CHEQUE",
-                       "ESTORNO"," RECEBIMENTO PIX","LIQ.COBRANCA SIMPLES","DEP CHEQUE 24H CANAIS","DEPOSITO CX ELETRONICO" ]
-    return any(keyword in description for keyword in credit_keywords)
-
 def extract_sicredi(pdf_path, output_txt_path, cabecalho):
-    print("sicredi")
-    reader = PdfReader(pdf_path)
-    extracted_text = [page.extract_text() for page in reader.pages]
+    try:
+        # Abre o arquivo PDF e extrai o texto
+        with open(pdf_path, 'rb') as arquivo_pdf:
+            leitor_pdf =PdfReader(arquivo_pdf)
+            texto_completo = ""
+            for pagina in range(len(leitor_pdf.pages)):
+                texto = leitor_pdf.pages[pagina].extract_text()
+                if texto:
+                    texto_completo += texto
+                else:
+                    print(f"Aviso: Nenhum texto extraído da página {pagina + 1}.")
 
-    pattern = r'(\d{2}/\d{2}/\d{4})\s+([\w\d\S\s]{9})\s{2}([\w\s\S]{50})\s+(\d{1,3}(?:\.\d{3})*,\d{2})'
-    entries = []
+        # Formatar as transações
+        transacoes = texto_completo.splitlines()
+        transacoes_formatadas = []
 
-    for page_text in extracted_text:
-        matches = re.findall(pattern, page_text, re.DOTALL)
-        entries.extend(matches)
+        # Expressão regular para validar o formato da data
+        padrao_data = re.compile(r"\d{2}/\d{2}/\d{4}")
 
-    formatted_txt_lines = ['Data;Historico;Documento;Valor Credito (Subtrai);Valor Debito (Soma);\n']
+        for transacao in transacoes:
+            # Extrair cada parte da linha com base nos tamanhos especificados
+            data = transacao[:13].strip()
+            codigo = transacao[13:24].strip()
+            historico = transacao[24:72].strip()
+            debito = transacao[72:92].strip().replace(".", "")
+            credito = transacao[92:112].strip().replace(".", "")
+            saldo = transacao[112:132].strip()
 
-    for entry in entries:
-        date, code, description, value = entry
-        amount = value.replace('.', '')
+            # Verificar se o campo de data está no formato correto
+            if padrao_data.fullmatch(data):
+                # Formatar a linha
+                transacao_formatada = f"{data} ; {historico} ; {codigo} ; {debito} ; {credito} ; ;"
+                transacoes_formatadas.append(transacao_formatada)
 
-        if credito(description):
-            line = f"{date};{description};{code};{amount};;\n"
-        elif debito(description):
-            line = f"{date};{description};{code};;{amount};\n"
-        else:
-            line = f"{date};{description};{code};{amount};;\n"
+        # Salvar as transações formatadas em um arquivo TXT
+        with open(output_txt_path, 'w', encoding='utf-8') as arquivo_txt:
+            arquivo_txt.write(cabecalho)
+            for transacao in transacoes_formatadas:
+                arquivo_txt.write(transacao + '\n')
+        print(f"Transações salvas em {output_txt_path}.")
 
-        formatted_txt_lines.append(line)
-
-    with open(output_txt_path, 'w', encoding='utf-8') as text_file:
-        text_file.write(cabecalho)
-        text_file.writelines(formatted_txt_lines)
+    except FileNotFoundError:
+        print(f"Erro: O arquivo PDF '{pdf_path}' não foi encontrado.")
+    except Exception as e:
+        print(f"Ocorreu um erro: {e}")
 
